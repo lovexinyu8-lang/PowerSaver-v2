@@ -1,0 +1,12 @@
+# Logs & Configs
+*.log
+*.config.json
+
+# Windows temporary files
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# VS Code / IDE
+.vscode/
+.idea/

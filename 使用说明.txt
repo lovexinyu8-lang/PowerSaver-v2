@@ -1,0 +1,38 @@
+PowerSaver v2 使用说明
+=====================
+
+文件
+----
+PowerSaver-v2.ps1              主脚本（-Mode Battery/AC/Auto，含 -DryRun 自检模式）
+Install-PowerSaverTasks-v2.ps1 安装脚本（管理员运行一次即可）
+Cleanup-Touchpad-Once.ps1      触摸板残留值清理（安装脚本优先直写修复，失败时以 SYSTEM 任务兜底，无需手动执行）
+
+安装步骤（在目标机器上）
+------------------------
+1. 将三个 .ps1 文件解压到 D:\Scripts\（目录不存在就先建）
+2. 以管理员身份打开 PowerShell（Win+X -> 终端(管理员)），执行：
+     powershell -ExecutionPolicy Bypass -File "D:\Scripts\Install-PowerSaverTasks-v2.ps1"
+3. 安装脚本会依次：
+     - 停用旧任务 PowerSaver_OnBattery / PowerSaver_OnAC（保留，可用 schtasks /Change /TN <任务名> /ENABLE 回滚）
+     - 创建新任务 PowerSaver_OnBattery_v2 / PowerSaver_OnAC_v2（监听 Kernel-Power 105/104 事件）
+     - 桌面快捷方式改指 v2（-Mode Auto）
+     - 恢复触摸板 EPM/D3Cold 残留值（管理员直写；失败时以 SYSTEM 任务兜底）
+     - 立即按当前电源状态应用一次
+4. 验证：查看 C:\Users\<用户名>\powersaver-v2.log
+     - 拔电应有：CPU cap DC -> 80% (explicit PowerSaver GUID)
+     - 插电应有：CPU cap removed from PowerSaver scheme
+
+参数
+----
+-Mode Battery|AC|Auto   指定模式（Auto = 自动检测电源）
+-Force                  忽略幂等检查强制重新应用
+-DryRun                 只探测不修改（自检用）
+-CpuCap 0-100           覆盖电池模式 CPU 上限（默认 80，0 = 不设上限）
+-LogPath / -ConfigPath  覆盖日志/配置路径
+
+注意
+----
+- Cleanup-Touchpad-Once.ps1 中的注册表路径 SYNA2BA6 是原机器触摸板硬件 ID；
+  换机器运行时若路径不存在只会记录失败，无副作用。
+- 若目标机器的 Lenovo WMI 接口可用，v2 会自动探测并优先使用（结果缓存于配置文件）。
+- 配置文件：C:\Users\<用户名>\powersaver-v2.config.json
