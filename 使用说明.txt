@@ -1,38 +1,41 @@
 PowerSaver v2 使用说明
 =====================
 
-文件
-----
-PowerSaver-v2.ps1              主脚本（-Mode Battery/AC/Auto，含 -DryRun 自检模式）
-Install-PowerSaverTasks-v2.ps1 安装脚本（管理员运行一次即可）
-Cleanup-Touchpad-Once.ps1      触摸板残留值清理（安装脚本优先直写修复，失败时以 SYSTEM 任务兜底，无需手动执行）
+文件列表
+--------
+PowerSaver-v2.ps1              主调度与 UI 脚本（支持 -Mode Menu/HighPerf/PowerSaver/Auto/Toggle）
+Install-PowerSaverTasks-v2.ps1 一键安装脚本（管理员运行一次即可）
+Toggle-PowerMode.ps1           便捷调用包装（默认打开控制面板）
+Cleanup-Touchpad-Once.ps1      历史触摸板残留值修复兜底（安装时自动处理，无需手动执行）
 
 安装步骤（在目标机器上）
 ------------------------
-1. 将三个 .ps1 文件解压到 D:\Scripts\（目录不存在就先建）
-2. 以管理员身份打开 PowerShell（Win+X -> 终端(管理员)），执行：
+1. 将所有文件放置到 D:\Scripts\（目录不存在就先建）
+2. 以管理员身份打开 PowerShell，执行：
      powershell -ExecutionPolicy Bypass -File "D:\Scripts\Install-PowerSaverTasks-v2.ps1"
 3. 安装脚本会依次：
-     - 停用旧任务 PowerSaver_OnBattery / PowerSaver_OnAC（保留，可用 schtasks /Change /TN <任务名> /ENABLE 回滚）
-     - 创建新任务 PowerSaver_OnBattery_v2 / PowerSaver_OnAC_v2（监听 Kernel-Power 105/104 事件）
-     - 桌面快捷方式改指 v2（-Mode Auto）
-     - 恢复触摸板 EPM/D3Cold 残留值（管理员直写；失败时以 SYSTEM 任务兜底）
-     - 立即按当前电源状态应用一次
-4. 验证：查看 C:\Users\<用户名>\powersaver-v2.log
-     - 拔电应有：CPU cap DC -> 80% (explicit PowerSaver GUID)
-     - 插电应有：CPU cap removed from PowerSaver scheme
+     - 停用旧任务并创建新任务 PowerSaver_OnBattery_v2 / PowerSaver_OnAC_v2（监听 Kernel-Power 105/104 事件）
+     - 开启计划任务在电池供电下运行的权限设置
+     - 在桌面生成/更新 Toggle Power Mode.lnk（双击打开控制面板）
+     - 修复触摸板 EPM/D3Cold 历史残留值
+     - 立即按当前电源状态应用一次配置
 
-参数
-----
--Mode Battery|AC|Auto   指定模式（Auto = 自动检测电源）
--Force                  忽略幂等检查强制重新应用
--DryRun                 只探测不修改（自检用）
--CpuCap 0-100           覆盖电池模式 CPU 上限（默认 80，0 = 不设上限）
--LogPath / -ConfigPath  覆盖日志/配置路径
+使用方法
+--------
+1. 双击桌面快捷方式 Toggle Power Mode.lnk：
+   - 弹出深色卡片控制面板，直观查看当前供电与性能方案
+   - [🚀 高性能模式]：即使不插电也可全速运行，CPU 上限 100%，动效全开（带防睡眠误切锁定）
+   - [🔋 节能省电模式]：锁定 80% CPU，精简动画，降温省电
+   - [🔄 自动模式]：重置手动锁定，根据是否插电自动切换
+   - 快捷键支持：按 1 高性能、2 节能、3 自动、Esc 退出
 
-注意
-----
-- Cleanup-Touchpad-Once.ps1 中的注册表路径 SYNA2BA6 是原机器触摸板硬件 ID；
-  换机器运行时若路径不存在只会记录失败，无副作用。
-- 若目标机器的 Lenovo WMI 接口可用，v2 会自动探测并优先使用（结果缓存于配置文件）。
+2. 命令行与静默调用：
+   - powershell -ExecutionPolicy Bypass -File .\PowerSaver-v2.ps1 -Mode HighPerf   # 强制开高性能
+   - powershell -ExecutionPolicy Bypass -File .\PowerSaver-v2.ps1 -Mode PowerSaver # 强制开节能
+   - powershell -ExecutionPolicy Bypass -File .\PowerSaver-v2.ps1 -Mode Toggle     # 翻转模式
+   - powershell -ExecutionPolicy Bypass -File .\PowerSaver-v2.ps1 -Mode Auto       # 自动模式
+
+验证与日志
+----------
+- 运行日志：C:\Users\<用户名>\powersaver-v2.log
 - 配置文件：C:\Users\<用户名>\powersaver-v2.config.json

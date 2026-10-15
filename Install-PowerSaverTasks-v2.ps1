@@ -60,12 +60,12 @@ $desktop = [Environment]::GetFolderPath("Desktop")
 $wsh = New-Object -ComObject WScript.Shell
 $shortcut = $wsh.CreateShortcut("$desktop\Toggle Power Mode.lnk")
 $shortcut.TargetPath = "powershell.exe"
-$shortcut.Arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$v2Script`" -Mode Auto"
+$shortcut.Arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$v2Script`" -Mode Menu"
 $shortcut.WorkingDirectory = $scriptDir
 $shortcut.WindowStyle = 7
 $shortcut.IconLocation = "shell32.dll,167"
 $shortcut.Save()
-Write-Host "  [OK] Toggle Power Mode.lnk -> PowerSaver-v2.ps1 -Mode Auto" -ForegroundColor Green
+Write-Host "  [OK] Toggle Power Mode.lnk -> PowerSaver-v2.ps1 -Mode Menu" -ForegroundColor Green
 
 # --- 4. Restore leftover touchpad reg values: direct elevated write first, SYSTEM task fallback ---
 # 本机实测: 管理员直写可成功; 而 SYSTEM 任务在此机器上不派发, 只能作兜底

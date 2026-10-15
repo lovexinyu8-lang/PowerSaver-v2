@@ -1,23 +1,19 @@
 ﻿# PowerSaver-v2.ps1
 # 用法:
-#   powershell.exe -ExecutionPolicy Bypass -File PowerSaver-v2.ps1 -Mode Battery|AC|Auto
+#   powershell.exe -ExecutionPolicy Bypass -File PowerSaver-v2.ps1 -Mode Menu|Battery|AC|Auto|Toggle|HighPerf|PowerSaver
 #   -Force       忽略 LastMode 幂等检查, 强制重新应用
 #   -DryRun      只探测不修改 (所有写操作跳过)
 #   -CpuCap N    覆盖 CPU 上限 (默认 80; -1 = 用配置文件值或默认)
 #   -LogPath / -ConfigPath  覆盖日志/配置文件路径 (测试用)
 #
-# v2 修复内容 (对应旧版问题):
-#   A. 恢复链: 保存原方案时不再用空对象覆盖已有 config
-#   B. CPU 上限: 写入与删除都显式指向节能方案 GUID (旧版写节能删高性能, 永久残留)
-#   C. 视觉效果: 自动化 (7 项动画 SystemParametersInfo 开关), 不再弹窗要求手动
-#   D. WiFi: 节能方案出厂 DC 已是最省电(3), 无需再写
-#   E. 触摸板: 移除注册表段 (方向反省电 + 权限不稳); 残留值由一次性清理脚本恢复
-#   F. 健壮性: Get-CimInstance 替代 Get-WmiObject / 互斥锁 / 幂等 / 日志轮转 / 原子写 config
-#   G. Lenovo 接口: 探测结果缓存到 config, 避免每次重复探测; 修复类名 (LENOVO_SET_FAN_TABLE_MODE -> LENOVO_FAN_TABLE_DATA);
-#      Lenovo Process Management Event 只读探测, 不写入 (接口未验证)
+# v2.1 更新:
+#   1. 支持 -Mode Menu: 弹出 WPF 交互式控制面板，手动选择【高性能】/【节能省电】/【自动】模式
+#   2. 支持不插电强开高性能: 即使电池供电，也可解除 80% CPU 限制并切换到高性能方案
+#   3. ManualOverride 防误切机制: 用户手动选择高性能后，系统待机唤醒不会被误切回省电模式
+#   4. 插电时自动重置 ManualOverride，恢复随电源插拔自动管理
 
 param(
-    [ValidateSet("Battery", "AC", "Auto")]
+    [ValidateSet("Battery", "AC", "Auto", "Menu", "Toggle", "HighPerf", "PowerSaver")]
     [string] $Mode = "Auto",
 
     [switch] $Force,
@@ -35,8 +31,8 @@ $ErrorActionPreference = "Continue"
 # ============================================================
 # 常量
 # ============================================================
-$script:PowerSaverGUID  = "a1841308-3541-4fab-bc81-f71556f20b4a"   # 节能
-$script:HighPerfGUID    = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"   # 高性能 (25H2 上被隐藏但仍可切换)
+$script:PowerSaverGUID  = "a1841308-3541-4fab-bc81-f71556f20b4a"   # 节能方案
+$script:HighPerfGUID    = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"   # 高性能方案
 $script:SubProcessor    = "54533251-82be-4824-96c1-47b60b740d00"
 $script:ProcThrottleMax = "bc5038f7-23e0-4960-96da-33abaf5935ec"
 $script:SubBattery      = "e73a048d-bf27-4f12-9731-8b2076e8891f"
@@ -78,6 +74,7 @@ function New-DefaultConfig {
         CpuCapDc        = $null
         LenovoInterface = $null
         VisualFX        = $null
+        ManualOverride  = $null
     }
 }
 
@@ -198,7 +195,7 @@ function Resolve-LenovoInterface($cfg, [bool]$reprobe) {
         Write-Log "Lenovo probe: GAMEZONE_DATA not supported ($($_.Exception.Message))"
     }
 
-    # 2. FAN_TABLE_DATA (旧版类名 LENOVO_SET_FAN_TABLE_MODE 是无效类, 真实类名是这个)
+    # 2. FAN_TABLE_DATA
     try {
         $fan = Get-CimInstance -Namespace root/WMI -ClassName LENOVO_FAN_TABLE_DATA -ErrorAction Stop
         if ($fan -and ($fan.PSObject.Methods.Name -contains "SetFanTableMode")) {
@@ -273,7 +270,6 @@ function Apply-LenovoAc($iface) {
     }
 }
 
-# G: Lenovo Process Management Event 只读探测 (不写入, 接口未验证)
 function Get-LenovoPmeInfo {
     $out = powercfg /Q $script:MaxPerfOverlay $script:SubBattery $script:LenovoPme 2>&1 | Out-String
     $ac = ""; $dc = ""
@@ -284,18 +280,25 @@ function Get-LenovoPmeInfo {
 }
 
 # ============================================================
-# 电池模式
+# 电池/节能模式
 # ============================================================
-function Invoke-BatteryMode($cfg) {
-    Write-Log "===== BATTERY ====="
+function Invoke-BatteryMode($cfg, [bool]$manual = $false) {
+    Write-Log "===== BATTERY (manual=$manual) ====="
 
-    # 幂等: 重复 105 事件不重复执行
-    if (-not $Force -and $cfg.LastMode -eq "Battery") {
+    # 如果系统事件自动触发且处于用户手动锁定高性能模式，跳过
+    if (-not $Force -and -not $manual -and $cfg.ManualOverride -eq "HighPerf") {
+        Write-Log "ManualOverride=HighPerf active; skipping automatic Battery switch"
+        return
+    }
+
+    if ($manual) {
+        $cfg.ManualOverride = "Battery"
+    } elseif (-not $Force -and $cfg.LastMode -eq "Battery") {
         Write-Log "LastMode=Battery, already applied; skip (use -Force to re-apply)"
         return
     }
 
-    # A: 保存原方案 (修复: 不清空已有值)
+    # A: 保存原方案
     $active = Get-ActiveSchemeGuid
     if ($active -and $active -ne $script:PowerSaverGUID) {
         $cfg.PowerScheme = $active
@@ -315,7 +318,7 @@ function Invoke-BatteryMode($cfg) {
         else { Write-Log "Scheme switch FAILED (exit $LASTEXITCODE)" }
     }
 
-    # G: Lenovo 接口 (缓存; -Force 重探)
+    # G: Lenovo 接口
     $iface = Resolve-LenovoInterface $cfg $Force
     if ($iface -ne "None") {
         if ($DryRun) { Write-Log "[DRYRUN] would apply Lenovo battery mode via $iface" }
@@ -366,14 +369,21 @@ function Invoke-BatteryMode($cfg) {
 }
 
 # ============================================================
-# AC 模式
+# AC/高性能模式
 # ============================================================
-function Invoke-AcMode($cfg) {
-    Write-Log "===== AC ====="
+function Invoke-AcMode($cfg, [bool]$manual = $false) {
+    Write-Log "===== AC/HIGH-PERF (manual=$manual) ====="
 
-    if (-not $Force -and $cfg.LastMode -eq "AC") {
-        Write-Log "LastMode=AC, already applied; skip (use -Force to re-apply)"
-        return
+    if ($manual) {
+        $cfg.ManualOverride = "HighPerf"
+    } else {
+        $wasOverridden = ($null -ne $cfg.ManualOverride)
+        $cfg.ManualOverride = $null
+        if (-not $Force -and $cfg.LastMode -eq "AC") {
+            Write-Log "LastMode=AC, already applied; skip (use -Force to re-apply)"
+            if ($wasOverridden -and -not $DryRun) { Save-Config $cfg }
+            return
+        }
     }
 
     # A: 恢复方案
@@ -391,7 +401,7 @@ function Invoke-AcMode($cfg) {
         }
     }
 
-    # B: 解除 CPU 上限 (显式节能方案 GUID; 25H2 已移除 /DELETEVALUEINDEX 命令, 改为显式写回 100 = 无限制)
+    # B: 解除 CPU 上限 (写回 100% = 无限制)
     if ($DryRun) {
         Write-Log "[DRYRUN] would reset PROCTHROTTLEMAX DC to 100% on PowerSaver scheme"
     } else {
@@ -405,7 +415,7 @@ function Invoke-AcMode($cfg) {
         if ($LASTEXITCODE -ne 0) { Write-Log "SETACTIVE failed (exit $LASTEXITCODE)" }
     }
 
-    # Lenovo 反向 (本机缓存 None -> 跳过)
+    # Lenovo 反向
     $iface = Resolve-LenovoInterface $cfg $Force
     if ($iface -ne "None") {
         if ($DryRun) { Write-Log "[DRYRUN] would apply Lenovo performance mode via $iface" }
@@ -438,20 +448,255 @@ function Invoke-AcMode($cfg) {
 }
 
 # ============================================================
+# 自动模式 (清除手动覆盖, 根据当前插电状态重算)
+# ============================================================
+function Invoke-AutoMode($cfg) {
+    Write-Log "===== AUTO ====="
+    $cfg.ManualOverride = $null
+    $source = Get-PowerSource
+    if ($source -eq "Battery") {
+        Invoke-BatteryMode $cfg $false
+    } else {
+        Invoke-AcMode $cfg $false
+    }
+}
+
+# ============================================================
+# 翻转模式 (Toggle: 节能 <-> 高性能)
+# ============================================================
+function Invoke-ToggleMode($cfg) {
+    Write-Log "===== TOGGLE ====="
+    $active = Get-ActiveSchemeGuid
+    if ($active -eq $script:PowerSaverGUID -or $cfg.LastMode -eq "Battery") {
+        Invoke-AcMode $cfg $true
+        return "HighPerf"
+    } else {
+        Invoke-BatteryMode $cfg $true
+        return "Battery"
+    }
+}
+
+# ============================================================
+# 互斥锁执行器 (超时 3 秒, 避免死锁或冲突)
+# ============================================================
+function Invoke-WithLock([scriptblock]$action) {
+    $mtx = New-Object System.Threading.Mutex($false, "Local\PowerSaverV2")
+    $hasLock = $false
+    try {
+        $hasLock = $mtx.WaitOne(3000)
+        if (-not $hasLock) {
+            Write-Log "Could not acquire mutex within 3s; exit"
+            return $false
+        }
+        & $action
+        return $true
+    } finally {
+        if ($hasLock) {
+            $mtx.ReleaseMutex()
+        }
+    }
+}
+
+# ============================================================
+# 图形界面 (WPF 现代卡片设计)
+# ============================================================
+function Show-PowerMenu {
+    Add-Type -AssemblyName PresentationFramework
+    Add-Type -AssemblyName PresentationCore
+    Add-Type -AssemblyName WindowsBase
+
+    $cfg = Load-Config
+    $bat = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
+    $isBattery = ($bat -and $bat.BatteryStatus -eq 1)
+    $percent = if ($bat) { $bat.EstimatedChargeRemaining } else { $null }
+    $activeGuid = Get-ActiveSchemeGuid
+
+    $sourceText = if ($isBattery) { "🔋 电池供电 (${percent}%)" } else { "⚡ 交流电源 (已插电)" }
+    $isSaver = ($activeGuid -eq $script:PowerSaverGUID)
+    $isHigh = ($activeGuid -eq $script:HighPerfGUID)
+
+    $statusTitle = if ($isSaver) { "🍃 节能省电模式 (80% CPU · 省电)" } elseif ($isHigh) { "🚀 高性能模式 (CPU 100% · 全速)" } else { "⚖️ 平衡 / 自定义方案" }
+    $statusColor = if ($isSaver) { "#4ade80" } elseif ($isHigh) { "#38bdf8" } else { "#fbbf24" }
+
+    $xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="⚡ 电源模式切换" Height="390" Width="385"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize"
+        Background="#18181b" Foreground="#f4f4f5"
+        FontFamily="Segoe UI, Microsoft YaHei UI, sans-serif"
+        Topmost="True">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <DockPanel Grid.Row="0" Margin="0,0,0,12">
+            <TextBlock Text="⚡ 电源模式选择" FontSize="16" FontWeight="Bold" Foreground="#ffffff"/>
+            <TextBlock x:Name="TxtPowerSource" Text="$sourceText" HorizontalAlignment="Right" FontSize="12" Foreground="#a1a1aa" VerticalAlignment="Center"/>
+        </DockPanel>
+
+        <!-- Current Status Banner -->
+        <Border Grid.Row="1" Background="#27272a" CornerRadius="6" Padding="10,8" Margin="0,0,0,14">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="当前状态：" FontSize="12" Foreground="#a1a1aa"/>
+                <TextBlock x:Name="TxtCurrentStatus" Text="$statusTitle" FontSize="12" FontWeight="SemiBold" Foreground="$statusColor"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Mode Buttons -->
+        <StackPanel Grid.Row="2">
+            <!-- High Perf Button -->
+            <Button x:Name="BtnHigh" Height="52" Margin="0,0,0,10" Cursor="Hand"
+                    Background="#1e293b" BorderBrush="#0284c7" BorderThickness="1.5">
+                <StackPanel HorizontalAlignment="Left" Margin="12,0,0,0">
+                    <TextBlock Text="🚀 高性能模式 (全速运行)" FontSize="13" FontWeight="Bold" Foreground="#38bdf8"/>
+                    <TextBlock Text="CPU 100% · 视觉动画开启 (不插电也可全速)" FontSize="10.5" Foreground="#94a3b8" Margin="0,2,0,0"/>
+                </StackPanel>
+            </Button>
+
+            <!-- Saver Button -->
+            <Button x:Name="BtnSaver" Height="52" Margin="0,0,0,10" Cursor="Hand"
+                    Background="#14291e" BorderBrush="#16a34a" BorderThickness="1.5">
+                <StackPanel HorizontalAlignment="Left" Margin="12,0,0,0">
+                    <TextBlock Text="🔋 节能省电模式 (长续航)" FontSize="13" FontWeight="Bold" Foreground="#4ade80"/>
+                    <TextBlock Text="CPU 限制 80% · 精简系统动画 · 降低发热" FontSize="10.5" Foreground="#86efac" Margin="0,2,0,0"/>
+                </StackPanel>
+            </Button>
+
+            <!-- Auto Button -->
+            <Button x:Name="BtnAuto" Height="48" Margin="0,0,0,10" Cursor="Hand"
+                    Background="#27272a" BorderBrush="#52525b" BorderThickness="1">
+                <StackPanel HorizontalAlignment="Left" Margin="12,0,0,0">
+                    <TextBlock Text="🔄 自动模式 (跟随供电状态)" FontSize="12.5" FontWeight="SemiBold" Foreground="#e4e4e7"/>
+                    <TextBlock Text="插电高性能 · 拔电自动节能" FontSize="10.5" Foreground="#a1a1aa" Margin="0,2,0,0"/>
+                </StackPanel>
+            </Button>
+        </StackPanel>
+
+        <!-- Footer -->
+        <DockPanel Grid.Row="3" Margin="0,4,0,0">
+            <TextBlock x:Name="TxtFeedback" Text="快捷键: [1] 高性能  [2] 节能  [3] 自动  [Esc] 退出" FontSize="11" Foreground="#71717a" VerticalAlignment="Center"/>
+        </DockPanel>
+    </Grid>
+</Window>
+"@
+
+    $win = [System.Windows.Markup.XamlReader]::Parse($xaml)
+    $btnHigh = $win.FindName("BtnHigh")
+    $btnSaver = $win.FindName("BtnSaver")
+    $btnAuto = $win.FindName("BtnAuto")
+    $txtFeedback = $win.FindName("TxtFeedback")
+    $txtCurrentStatus = $win.FindName("TxtCurrentStatus")
+
+    $closeTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $closeTimer.Interval = [TimeSpan]::FromMilliseconds(1100)
+    $closeTimer.Add_Tick({
+        $closeTimer.Stop()
+        $win.Close()
+    })
+
+    $applyAction = {
+        param([string]$targetMode)
+        $btnHigh.IsEnabled = $false
+        $btnSaver.IsEnabled = $false
+        $btnAuto.IsEnabled = $false
+
+        $txtFeedback.Text = "⏳ 正在应用 $targetMode..."
+        $txtFeedback.Foreground = "#facc15"
+
+        [System.Windows.Forms.Application]::DoEvents()
+
+        $null = Invoke-WithLock {
+            $cfg = Load-Config
+            switch ($targetMode) {
+                "HighPerf" {
+                    Invoke-AcMode $cfg $true
+                    $txtCurrentStatus.Text = "🚀 高性能模式 (CPU 100% · 全速)"
+                    $txtCurrentStatus.Foreground = "#38bdf8"
+                    $txtFeedback.Text = "✅ 已成功切换为【高性能模式】 (不插电全速运行)"
+                    $txtFeedback.Foreground = "#38bdf8"
+                }
+                "Battery" {
+                    Invoke-BatteryMode $cfg $true
+                    $txtCurrentStatus.Text = "🍃 节能省电模式 (80% CPU · 省电)"
+                    $txtCurrentStatus.Foreground = "#4ade80"
+                    $txtFeedback.Text = "✅ 已成功切换为【节能省电模式】 (CPU上限80%)"
+                    $txtFeedback.Foreground = "#4ade80"
+                }
+                "Auto" {
+                    Invoke-AutoMode $cfg
+                    $src = Get-PowerSource
+                    if ($src -eq "Battery") {
+                        $txtCurrentStatus.Text = "🍃 自动模式 -> 节能省电 (当前电池供电)"
+                        $txtCurrentStatus.Foreground = "#4ade80"
+                    } else {
+                        $txtCurrentStatus.Text = "🚀 自动模式 -> 高性能 (当前交流插电)"
+                        $txtCurrentStatus.Foreground = "#38bdf8"
+                    }
+                    $txtFeedback.Text = "✅ 已恢复【自动模式】 (将随插拔电自动切换)"
+                    $txtFeedback.Foreground = "#a1a1aa"
+                }
+            }
+        }
+        $closeTimer.Start()
+    }
+
+    $btnHigh.Add_Click({ & $applyAction "HighPerf" })
+    $btnSaver.Add_Click({ & $applyAction "Battery" })
+    $btnAuto.Add_Click({ & $applyAction "Auto" })
+
+    $win.Add_KeyDown({
+        param($s, $e)
+        if ($e.Key -eq [System.Windows.Input.Key]::D1 -or $e.Key -eq [System.Windows.Input.Key]::NumPad1 -or $e.Key -eq [System.Windows.Input.Key]::H) {
+            & $applyAction "HighPerf"
+        } elseif ($e.Key -eq [System.Windows.Input.Key]::D2 -or $e.Key -eq [System.Windows.Input.Key]::NumPad2 -or $e.Key -eq [System.Windows.Input.Key]::B -or $e.Key -eq [System.Windows.Input.Key]::S) {
+            & $applyAction "Battery"
+        } elseif ($e.Key -eq [System.Windows.Input.Key]::D3 -or $e.Key -eq [System.Windows.Input.Key]::NumPad3 -or $e.Key -eq [System.Windows.Input.Key]::A) {
+            & $applyAction "Auto"
+        } elseif ($e.Key -eq [System.Windows.Input.Key]::Escape) {
+            $win.Close()
+        }
+    })
+
+    $win.ShowDialog() | Out-Null
+}
+
+# ============================================================
 # 主流程
 # ============================================================
-$mtx = New-Object System.Threading.Mutex($false, "Local\PowerSaverV2")
-if (-not $mtx.WaitOne(0)) {
-    Write-Log "Another instance running; exit"
-    exit 1
+if ($Mode -eq "Menu") {
+    Show-PowerMenu
+    exit 0
 }
-$acquired = $true
 
-try {
+$null = Invoke-WithLock {
     $cfg = Load-Config
-    $mode = if ($Mode -eq "Auto") { Get-PowerSource } else { $Mode }
-    Write-Log ("===== RUN $mode =====")
-    if ($mode -eq "Battery") { Invoke-BatteryMode $cfg } else { Invoke-AcMode $cfg }
-} finally {
-    if ($acquired) { $mtx.ReleaseMutex() }
+    switch ($Mode) {
+        "Toggle" {
+            Invoke-ToggleMode $cfg
+        }
+        "HighPerf" {
+            Invoke-AcMode $cfg $true
+        }
+        "PowerSaver" {
+            Invoke-BatteryMode $cfg $true
+        }
+        "Auto" {
+            $mode = Get-PowerSource
+            Write-Log ("===== RUN Auto -> $mode =====")
+            if ($mode -eq "Battery") { Invoke-BatteryMode $cfg $false } else { Invoke-AcMode $cfg $false }
+        }
+        "Battery" {
+            Invoke-BatteryMode $cfg $false
+        }
+        "AC" {
+            Invoke-AcMode $cfg $false
+        }
+    }
 }
