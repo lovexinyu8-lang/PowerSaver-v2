@@ -6,11 +6,11 @@
 #   -CpuCap N    覆盖 CPU 上限 (默认 80; -1 = 用配置文件值或默认)
 #   -LogPath / -ConfigPath  覆盖日志/配置文件路径 (测试用)
 #
-# v2.1 更新:
-#   1. 支持 -Mode Menu: 弹出 WPF 交互式控制面板，手动选择【高性能】/【节能省电】/【自动】模式
-#   2. 支持不插电强开高性能: 即使电池供电，也可解除 80% CPU 限制并切换到高性能方案
-#   3. ManualOverride 防误切机制: 用户手动选择高性能后，系统待机唤醒不会被误切回省电模式
-#   4. 插电时自动重置 ManualOverride，恢复随电源插拔自动管理
+# v2.2 更新:
+#   1. CPU 睿频精细化控制 (PERFBOOSTMODE): 电池模式关闭激进睿频 (0)，彻底消除电压尖峰发热；高性能模式恢复激进睿频 (1)
+#   2. Windows 11 EcoQoS (能效模式) 自动化分流: 拔电自动将后台闲置软件降至效率模式，锁入 E/LPE 核心，不卡前台；插电解除
+#   3. 联想硬件功耗协同 (Fn+Q) 状态提示: 并在控制面板中提供野兽(红)/安静(蓝)/均衡(白)档位指引，实现软硬件双全开
+#   4. 严格保持屏幕刷新率原样不动 (满足 120Hz 高刷刚需)
 
 param(
     [ValidateSet("Battery", "AC", "Auto", "Menu", "Toggle", "HighPerf", "PowerSaver")]
@@ -35,6 +35,7 @@ $script:PowerSaverGUID  = "a1841308-3541-4fab-bc81-f71556f20b4a"   # 节能方�
 $script:HighPerfGUID    = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"   # 高性能方案
 $script:SubProcessor    = "54533251-82be-4824-96c1-47b60b740d00"
 $script:ProcThrottleMax = "bc5038f7-23e0-4960-96da-33abaf5935ec"
+$script:PerfBoostMode   = "be337238-0d82-4146-a960-4f3749d470c7"   # 处理器性能提升模式 (睿频控制)
 $script:SubBattery      = "e73a048d-bf27-4f12-9731-8b2076e8891f"
 $script:LenovoPme       = "71042a74-67c5-4a2d-9f50-dbf79f9e4899"   # Lenovo Process Management Event
 $script:MaxPerfOverlay  = "ded574b5-45a0-4f42-8737-46345c09c238"   # 最大性能叠加方案
@@ -174,6 +175,96 @@ function Get-ZeroFx {
     $zero = @{}
     foreach ($e in $script:FxEffects) { $zero[$e["Name"]] = [uint32]0 }
     return $zero
+}
+
+# ============================================================
+# Windows 11 EcoQoS (能效模式) 调度支持
+# ============================================================
+$script:EcoQoSTypeReady = $false
+
+function Ensure-EcoQoSType {
+    if ($script:EcoQoSTypeReady) { return }
+    if (-not ("WinPower.EcoQoS" -as [type])) {
+        $src = @'
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+namespace WinPower {
+    public static class EcoQoS {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PROCESS_POWER_THROTTLING_STATE {
+            public uint Version;
+            public uint ControlMask;
+            public uint StateMask;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool SetProcessInformation(
+            IntPtr hProcess,
+            int ProcessInformationClass,
+            ref PROCESS_POWER_THROTTLING_STATE ProcessInformation,
+            uint ProcessInformationSize
+        );
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        public static uint GetForegroundProcessId() {
+            IntPtr hwnd = GetForegroundWindow();
+            if (hwnd == IntPtr.Zero) return 0;
+            uint pid;
+            GetWindowThreadProcessId(hwnd, out pid);
+            return pid;
+        }
+
+        public static bool SetProcessEcoQoS(IntPtr hProcess, bool enable) {
+            PROCESS_POWER_THROTTLING_STATE s = new PROCESS_POWER_THROTTLING_STATE();
+            s.Version = 1;
+            s.ControlMask = 1; // PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            s.StateMask = enable ? 1u : 0u;
+            return SetProcessInformation(hProcess, 4, ref s, (uint)Marshal.SizeOf(s));
+        }
+    }
+}
+'@
+        Add-Type -TypeDefinition $src -ErrorAction Stop
+    }
+    $script:EcoQoSTypeReady = $true
+}
+
+function Set-EcoQoSForBackgroundApps([bool]$enable) {
+    try {
+        Ensure-EcoQoSType
+        $fgPid = [WinPower.EcoQoS]::GetForegroundProcessId()
+
+        # 典型后台高耗电软件名单 (不影响前台正在使用的应用)
+        $targetNames = @(
+            'msedge', 'chrome', 'firefox', 'qq', 'wechat', 'wemeet', 'dingtalk',
+            'feishu', 'onedrive', 'dropbox', 'steam', 'clash-verge', 'clash',
+            'searchindexer', 'powershell', 'wscript'
+        )
+
+        $count = 0
+        foreach ($name in $targetNames) {
+            $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
+            foreach ($p in $procs) {
+                # 排除当前前台焦点窗口和自身进程，保证活动软件丝滑
+                if ($p.Id -ne $fgPid -and $p.Id -ne $PID) {
+                    try {
+                        $ok = [WinPower.EcoQoS]::SetProcessEcoQoS($p.Handle, $enable)
+                        if ($ok) { $count++ }
+                    } catch { }
+                }
+            }
+        }
+        $actionStr = if ($enable) { "applied to" } else { "removed from" }
+        Write-Log "EcoQoS: $actionStr $count background processes (foreground PID $fgPid excluded)"
+    } catch {
+        Write-Log "EcoQoS operation failed: $_"
+    }
 }
 
 # ============================================================
@@ -325,7 +416,7 @@ function Invoke-BatteryMode($cfg, [bool]$manual = $false) {
         else { Apply-LenovoBattery $iface }
     }
 
-    # B: CPU 上限显式写节能方案 (只在无 Lenovo 接口时兜底)
+    # B: CPU 上限与睿频模式 (只在无 Lenovo 接口时兜底)
     if ($iface -eq "None") {
         $cap = if ($CpuCap -ge 0) { $CpuCap } elseif ($cfg.CpuCapDc) { [int]$cfg.CpuCapDc } else { 80 }
         if ($cap -eq 0) {
@@ -333,13 +424,18 @@ function Invoke-BatteryMode($cfg, [bool]$manual = $false) {
         } else {
             $cfg.CpuCapDc = $cap
             if ($DryRun) {
-                Write-Log "[DRYRUN] would set PROCTHROTTLEMAX DC=$cap on PowerSaver scheme (explicit GUID)"
+                Write-Log "[DRYRUN] would set PROCTHROTTLEMAX DC=$cap on PowerSaver scheme"
+                Write-Log "[DRYRUN] would set PERFBOOSTMODE DC=0 (Disabled) on PowerSaver scheme"
             } else {
+                # 设定 CPU 80% 频率上限
                 powercfg /SETDCVALUEINDEX $script:PowerSaverGUID $script:SubProcessor $script:ProcThrottleMax $cap 2>&1 | Out-Null
+                # 设定关闭激进睿频 (0=Disabled)，消除大电压脉冲与尖峰发热
+                powercfg /SETDCVALUEINDEX $script:PowerSaverGUID $script:SubProcessor $script:PerfBoostMode 0 2>&1 | Out-Null
+                
                 if ($LASTEXITCODE -eq 0) {
-                    Write-Log "CPU cap DC -> ${cap}% (explicit PowerSaver GUID)"
+                    Write-Log "CPU cap DC -> ${cap}% and BoostMode -> 0 (Disabled)"
                 } else {
-                    Write-Log "CPU cap set FAILED (exit $LASTEXITCODE)"
+                    Write-Log "CPU settings FAILED (exit $LASTEXITCODE)"
                 }
                 powercfg /SETACTIVE $script:PowerSaverGUID 2>&1 | Out-Null
             }
@@ -361,6 +457,13 @@ function Invoke-BatteryMode($cfg, [bool]$manual = $false) {
         } catch {
             Write-Log "Visual effects apply failed: $_"
         }
+    }
+
+    # D: Windows 11 EcoQoS (能效模式) 后台分流
+    if ($DryRun) {
+        Write-Log "[DRYRUN] would apply EcoQoS to background processes"
+    } else {
+        Set-EcoQoSForBackgroundApps $true
     }
 
     $cfg.LastMode = "Battery"
@@ -401,13 +504,17 @@ function Invoke-AcMode($cfg, [bool]$manual = $false) {
         }
     }
 
-    # B: 解除 CPU 上限 (写回 100% = 无限制)
+    # B: 解除 CPU 上限并恢复激进睿频 (PROCTHROTTLEMAX=100, PERFBOOSTMODE=1)
     if ($DryRun) {
-        Write-Log "[DRYRUN] would reset PROCTHROTTLEMAX DC to 100% on PowerSaver scheme"
+        Write-Log "[DRYRUN] would reset PROCTHROTTLEMAX to 100% and PERFBOOSTMODE to 1 (Aggressive)"
     } else {
         powercfg /SETDCVALUEINDEX $script:PowerSaverGUID $script:SubProcessor $script:ProcThrottleMax 100 2>&1 | Out-Null
+        powercfg /SETDCVALUEINDEX $script:PowerSaverGUID $script:SubProcessor $script:PerfBoostMode 1 2>&1 | Out-Null
+        powercfg /SETDCVALUEINDEX $target $script:SubProcessor $script:PerfBoostMode 1 2>&1 | Out-Null
+        powercfg /SETACVALUEINDEX $target $script:SubProcessor $script:PerfBoostMode 1 2>&1 | Out-Null
+        
         if ($LASTEXITCODE -eq 0) {
-            Write-Log "CPU cap DC reset to 100% (explicit PowerSaver GUID)"
+            Write-Log "CPU cap reset to 100% and BoostMode reset to 1 (Aggressive)"
         } else {
             Write-Log "CPU cap reset FAILED (exit $LASTEXITCODE)"
         }
@@ -440,6 +547,13 @@ function Invoke-AcMode($cfg, [bool]$manual = $false) {
         }
     } else {
         Write-Log "Visual effects: no saved state, skip restore"
+    }
+
+    # D: 恢复后台进程正常 QoS
+    if ($DryRun) {
+        Write-Log "[DRYRUN] would remove EcoQoS from background processes"
+    } else {
+        Set-EcoQoSForBackgroundApps $false
     }
 
     $cfg.LastMode = "AC"
@@ -515,20 +629,21 @@ function Show-PowerMenu {
     $isSaver = ($activeGuid -eq $script:PowerSaverGUID)
     $isHigh = ($activeGuid -eq $script:HighPerfGUID)
 
-    $statusTitle = if ($isSaver) { "🍃 节能省电模式 (80% CPU · 省电)" } elseif ($isHigh) { "🚀 高性能模式 (CPU 100% · 全速)" } else { "⚖️ 平衡 / 自定义方案" }
+    $statusTitle = if ($isSaver) { "🍃 节能省电模式 (80% CPU · 关闭睿频 · EcoQoS)" } elseif ($isHigh) { "🚀 高性能模式 (CPU 100% · 激进睿频 · 全速)" } else { "⚖️ 平衡 / 自定义方案" }
     $statusColor = if ($isSaver) { "#4ade80" } elseif ($isHigh) { "#38bdf8" } else { "#fbbf24" }
 
     $xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="⚡ 电源模式切换" Height="390" Width="385"
+        Title="⚡ 电源模式切换" Height="445" Width="390"
         WindowStartupLocation="CenterScreen"
         ResizeMode="NoResize"
         Background="#18181b" Foreground="#f4f4f5"
         FontFamily="Segoe UI, Microsoft YaHei UI, sans-serif"
         Topmost="True">
-    <Grid Margin="18">
+    <Grid Margin="18,16,18,16">
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
@@ -536,52 +651,63 @@ function Show-PowerMenu {
         </Grid.RowDefinitions>
 
         <!-- Header -->
-        <DockPanel Grid.Row="0" Margin="0,0,0,12">
+        <DockPanel Grid.Row="0" Margin="0,0,0,10">
             <TextBlock Text="⚡ 电源模式选择" FontSize="16" FontWeight="Bold" Foreground="#ffffff"/>
             <TextBlock x:Name="TxtPowerSource" Text="$sourceText" HorizontalAlignment="Right" FontSize="12" Foreground="#a1a1aa" VerticalAlignment="Center"/>
         </DockPanel>
 
         <!-- Current Status Banner -->
-        <Border Grid.Row="1" Background="#27272a" CornerRadius="6" Padding="10,8" Margin="0,0,0,14">
+        <Border Grid.Row="1" Background="#27272a" CornerRadius="6" Padding="10,7" Margin="0,0,0,10">
             <StackPanel Orientation="Horizontal">
-                <TextBlock Text="当前状态：" FontSize="12" Foreground="#a1a1aa"/>
-                <TextBlock x:Name="TxtCurrentStatus" Text="$statusTitle" FontSize="12" FontWeight="SemiBold" Foreground="$statusColor"/>
+                <TextBlock Text="当前状态：" FontSize="11.5" Foreground="#a1a1aa" VerticalAlignment="Center"/>
+                <TextBlock x:Name="TxtCurrentStatus" Text="$statusTitle" FontSize="11.5" FontWeight="SemiBold" Foreground="$statusColor" VerticalAlignment="Center"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Lenovo Hardware Fn+Q Synergy Card -->
+        <Border Grid.Row="2" Background="#202026" CornerRadius="6" Padding="10,7" Margin="0,0,0,12" BorderBrush="#3f3f46" BorderThickness="1">
+            <StackPanel>
+                <DockPanel Margin="0,0,0,3">
+                    <TextBlock Text="💻 联想硬件档位协同指引" FontSize="11" FontWeight="SemiBold" Foreground="#cbd5e1"/>
+                    <TextBlock Text="按 [Fn + Q] 切换指示灯" HorizontalAlignment="Right" FontSize="10" Foreground="#94a3b8"/>
+                </DockPanel>
+                <TextBlock x:Name="TxtLenovoTip" Text="• 🚀 高性能建议 🔴 红色灯（野兽） · 🔋 节能建议 🔵 蓝色灯（安静）" FontSize="10" Foreground="#a1a1aa" TextWrapping="Wrap"/>
             </StackPanel>
         </Border>
 
         <!-- Mode Buttons -->
-        <StackPanel Grid.Row="2">
+        <StackPanel Grid.Row="3">
             <!-- High Perf Button -->
-            <Button x:Name="BtnHigh" Height="52" Margin="0,0,0,10" Cursor="Hand"
+            <Button x:Name="BtnHigh" Height="50" Margin="0,0,0,9" Cursor="Hand"
                     Background="#1e293b" BorderBrush="#0284c7" BorderThickness="1.5">
                 <StackPanel HorizontalAlignment="Left" Margin="12,0,0,0">
-                    <TextBlock Text="🚀 高性能模式 (全速运行)" FontSize="13" FontWeight="Bold" Foreground="#38bdf8"/>
-                    <TextBlock Text="CPU 100% · 视觉动画开启 (不插电也可全速)" FontSize="10.5" Foreground="#94a3b8" Margin="0,2,0,0"/>
+                    <TextBlock Text="🚀 高性能模式 (全速运行)" FontSize="12.5" FontWeight="Bold" Foreground="#38bdf8"/>
+                    <TextBlock Text="CPU 100% · 激进睿频全开 · 特效全开 (不插电也可全速)" FontSize="10" Foreground="#94a3b8" Margin="0,2,0,0"/>
                 </StackPanel>
             </Button>
 
             <!-- Saver Button -->
-            <Button x:Name="BtnSaver" Height="52" Margin="0,0,0,10" Cursor="Hand"
+            <Button x:Name="BtnSaver" Height="50" Margin="0,0,0,9" Cursor="Hand"
                     Background="#14291e" BorderBrush="#16a34a" BorderThickness="1.5">
                 <StackPanel HorizontalAlignment="Left" Margin="12,0,0,0">
-                    <TextBlock Text="🔋 节能省电模式 (长续航)" FontSize="13" FontWeight="Bold" Foreground="#4ade80"/>
-                    <TextBlock Text="CPU 限制 80% · 精简系统动画 · 降低发热" FontSize="10.5" Foreground="#86efac" Margin="0,2,0,0"/>
+                    <TextBlock Text="🔋 节能省电模式 (长续航)" FontSize="12.5" FontWeight="Bold" Foreground="#4ade80"/>
+                    <TextBlock Text="CPU 80% · 关闭睿频防发热 · 后台 EcoQoS 能效分流" FontSize="10" Foreground="#86efac" Margin="0,2,0,0"/>
                 </StackPanel>
             </Button>
 
             <!-- Auto Button -->
-            <Button x:Name="BtnAuto" Height="48" Margin="0,0,0,10" Cursor="Hand"
+            <Button x:Name="BtnAuto" Height="46" Margin="0,0,0,6" Cursor="Hand"
                     Background="#27272a" BorderBrush="#52525b" BorderThickness="1">
                 <StackPanel HorizontalAlignment="Left" Margin="12,0,0,0">
-                    <TextBlock Text="🔄 自动模式 (跟随供电状态)" FontSize="12.5" FontWeight="SemiBold" Foreground="#e4e4e7"/>
-                    <TextBlock Text="插电高性能 · 拔电自动节能" FontSize="10.5" Foreground="#a1a1aa" Margin="0,2,0,0"/>
+                    <TextBlock Text="🔄 自动模式 (跟随供电状态)" FontSize="12" FontWeight="SemiBold" Foreground="#e4e4e7"/>
+                    <TextBlock Text="插电高性能 · 拔电自动节能与能效分流" FontSize="10" Foreground="#a1a1aa" Margin="0,1,0,0"/>
                 </StackPanel>
             </Button>
         </StackPanel>
 
         <!-- Footer -->
-        <DockPanel Grid.Row="3" Margin="0,4,0,0">
-            <TextBlock x:Name="TxtFeedback" Text="快捷键: [1] 高性能  [2] 节能  [3] 自动  [Esc] 退出" FontSize="11" Foreground="#71717a" VerticalAlignment="Center"/>
+        <DockPanel Grid.Row="4" Margin="0,2,0,0">
+            <TextBlock x:Name="TxtFeedback" Text="快捷键: [1] 高性能  [2] 节能  [3] 自动  [Esc] 退出" FontSize="10.5" Foreground="#71717a" VerticalAlignment="Center"/>
         </DockPanel>
     </Grid>
 </Window>
@@ -593,9 +719,10 @@ function Show-PowerMenu {
     $btnAuto = $win.FindName("BtnAuto")
     $txtFeedback = $win.FindName("TxtFeedback")
     $txtCurrentStatus = $win.FindName("TxtCurrentStatus")
+    $txtLenovoTip = $win.FindName("TxtLenovoTip")
 
     $closeTimer = New-Object System.Windows.Threading.DispatcherTimer
-    $closeTimer.Interval = [TimeSpan]::FromMilliseconds(1100)
+    $closeTimer.Interval = [TimeSpan]::FromMilliseconds(1300)
     $closeTimer.Add_Tick({
         $closeTimer.Stop()
         $win.Close()
@@ -617,16 +744,20 @@ function Show-PowerMenu {
             switch ($targetMode) {
                 "HighPerf" {
                     Invoke-AcMode $cfg $true
-                    $txtCurrentStatus.Text = "🚀 高性能模式 (CPU 100% · 全速)"
+                    $txtCurrentStatus.Text = "🚀 高性能模式 (CPU 100% · 睿频全开)"
                     $txtCurrentStatus.Foreground = "#38bdf8"
-                    $txtFeedback.Text = "✅ 已成功切换为【高性能模式】 (不插电全速运行)"
+                    $txtLenovoTip.Text = "• 建议配合 [Fn + Q] 切至 🔴 红色指示灯（野兽模式，彻底解开功耗墙）"
+                    $txtLenovoTip.Foreground = "#38bdf8"
+                    $txtFeedback.Text = "✅ 已切换为【高性能模式】 (建议按 Fn+Q 切红灯)"
                     $txtFeedback.Foreground = "#38bdf8"
                 }
                 "Battery" {
                     Invoke-BatteryMode $cfg $true
-                    $txtCurrentStatus.Text = "🍃 节能省电模式 (80% CPU · 省电)"
+                    $txtCurrentStatus.Text = "🍃 节能省电模式 (80% CPU · 关睿频 · EcoQoS)"
                     $txtCurrentStatus.Foreground = "#4ade80"
-                    $txtFeedback.Text = "✅ 已成功切换为【节能省电模式】 (CPU上限80%)"
+                    $txtLenovoTip.Text = "• 建议配合 [Fn + Q] 切至 🔵 蓝色指示灯（安静模式，15W 控温静音）"
+                    $txtLenovoTip.Foreground = "#4ade80"
+                    $txtFeedback.Text = "✅ 已切换为【节能省电模式】 (建议按 Fn+Q 切蓝灯)"
                     $txtFeedback.Foreground = "#4ade80"
                 }
                 "Auto" {
@@ -635,11 +766,15 @@ function Show-PowerMenu {
                     if ($src -eq "Battery") {
                         $txtCurrentStatus.Text = "🍃 自动模式 -> 节能省电 (当前电池供电)"
                         $txtCurrentStatus.Foreground = "#4ade80"
+                        $txtLenovoTip.Text = "• 当前电池供电：建议按 [Fn + Q] 切至 🔵 蓝色安静模式"
+                        $txtLenovoTip.Foreground = "#4ade80"
                     } else {
                         $txtCurrentStatus.Text = "🚀 自动模式 -> 高性能 (当前交流插电)"
                         $txtCurrentStatus.Foreground = "#38bdf8"
+                        $txtLenovoTip.Text = "• 当前已接电源：建议按 [Fn + Q] 切至 ⚪ 均衡或 🔴 野兽模式"
+                        $txtLenovoTip.Foreground = "#38bdf8"
                     }
-                    $txtFeedback.Text = "✅ 已恢复【自动模式】 (将随插拔电自动切换)"
+                    $txtFeedback.Text = "✅ 已恢复【自动模式】 (将随插拔电自动调度)"
                     $txtFeedback.Foreground = "#a1a1aa"
                 }
             }
