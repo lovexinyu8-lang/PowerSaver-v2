@@ -36,7 +36,7 @@
 
 | 文件名 | 说明 |
 | :--- | :--- |
-| **`PowerSaver-v2.ps1`** | 核心调度与 UI 脚本（支持控制面板、高性能强开、翻转、自检与纯后台调用） |
+|[`PowerSaver-v2.ps1`](./PowerSaver-v2.ps1)| 核心调度与 UI 脚本（支持控制面板、高性能强开、翻转、自检与纯后台调用） |
 | **`Install-PowerSaverTasks-v2.ps1`** | 一键安装与计划任务部署脚本（管理员权限运行一次即可） |
 | **`Toggle-PowerMode.ps1`** | 便捷调用包装脚本（默认调用交互式菜单） |
 | **`Cleanup-Touchpad-Once.ps1`** | 历史触摸板残留值修复兜底脚本（安装时自动处理） |
